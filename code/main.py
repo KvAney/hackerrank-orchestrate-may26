@@ -131,11 +131,6 @@ def normalize_text(value: object) -> str:
 def tokenize(text: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9][a-z0-9']+", normalize_text(text)) if token not in STOPWORDS]
 
-
-def contains_any(text: str, phrases: Iterable[str]) -> bool:
-    return any(phrase in text for phrase in phrases)
-
-
 def clean_markdown(markdown: str) -> str:
     markdown = re.sub(r"^---\s.*?---\s*", " ", markdown, flags=re.S)
     markdown = re.sub(r"!\[[^\]]*]\([^)]*\)", " ", markdown)
@@ -160,20 +155,6 @@ def load_env_file(path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
-
-
-def stable_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def dense_cosine(left: list[float], right: list[float]) -> float:
-    if not left or not right or len(left) != len(right):
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(a * a for a in left)) or 1.0
-    right_norm = math.sqrt(sum(b * b for b in right)) or 1.0
-    return dot / (left_norm * right_norm)
-
 
 def extract_json_object(text: str) -> Optional[dict[str, Any]]:
     try:
@@ -408,21 +389,6 @@ class OpenRouterClient:
             rationale=rationale,
         )
 
-
-def extract_response_text(response: dict[str, Any]) -> str:
-    if isinstance(response.get("output_text"), str):
-        return response["output_text"]
-    parts: list[str] = []
-    for item in response.get("output", []):
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []):
-            if isinstance(content, dict):
-                text = content.get("text") or content.get("refusal")
-                if text:
-                    parts.append(str(text))
-    return "\n".join(parts).strip()
-
 class VectorStoreManager:
     """Simplified Semantic Vector Store using Hugging Face and Numpy."""
     def __init__(self, data_dir: Path, embedder: LocalEmbeddingClient):
@@ -556,27 +522,23 @@ class Classifier:
         return "product_issue"
 
     def decide(self, query: str, results: list[RetrievalResult], product_area: str, request_type: str, llm_assessment: Optional[LLMAssessment] = None) -> TriageDecision:
-        top_score = results[0].score if results else 0.0
-        reasons: list[str] = []
+            top_score = results[0].score if results else 0.0
+            reasons: list[str] = []
 
-        # 1. PRIORITY: If LLM flagged it (Down, Refund, Bug, or No Permission)
-        if llm_assessment and getattr(llm_assessment, 'needs_human', False):
-            reasons.append(f"AI Flagged: {llm_assessment.rationale}")
+            # 1. ESCALATION TRIGGER: AI explicitly asked for human or classified as a Bug
+            if llm_assessment and (getattr(llm_assessment, 'needs_human', False) or request_type == "bug"):
+                reasons.append(f"AI Flagged: {llm_assessment.rationale if llm_assessment.rationale else 'Technical bug/outage detected'}")
 
-        # 2. FALLBACK: If AI is offline, be aggressive about escalating "Refunds" and "Bugs"
-        elif not llm_assessment:
-            text = normalize_text(query)
-            if "refund" in text or "money back" in text or "not working" in text:
-                reasons.append("financial request or technical failure requiring review")
-            if top_score < LOW_CONFIDENCE_THRESHOLD:
-                reasons.append(f"low confidence fallback ({top_score:.2f})")
+            # 2. RANTS: If it's just invalid/rant, skip escalation and reply 'refusal'
+            if request_type == "invalid":
+                return TriageDecision("replied", product_area, "invalid", False, ("out of scope",))
 
-        # 3. RANTS: If it's just an invalid rant, don't escalate, just reply
-        if request_type == "invalid":
-            return TriageDecision("replied", product_area, "invalid", False, ("out of scope",))
+            # 3. SAFETY FALLBACK: If AI is offline and score is low
+            if not llm_assessment and top_score < LOW_CONFIDENCE_THRESHOLD:
+                reasons.append(f"Low retrieval confidence ({top_score:.2f})")
 
-        status = "escalated" if reasons else "replied"
-        return TriageDecision(status, product_area, request_type, top_score < LOW_CONFIDENCE_THRESHOLD, tuple(reasons))
+            status = "escalated" if reasons else "replied"
+            return TriageDecision(status, product_area, request_type, top_score < LOW_CONFIDENCE_THRESHOLD, tuple(reasons))
 
 class ResponseGenerator:
     def generate(
@@ -589,15 +551,15 @@ class ResponseGenerator:
         llm_assessment: Optional[LLMAssessment] = None,
         label_notes: Optional[list[str]] = None,
     ) -> tuple[str, str]:
-        # 1. Logic for Response selection (Existing Logic)
-        if llm_assessment and llm_assessment.response and decision.request_type != "invalid":
+       
+        # If the logic decided to escalate, DON'T use the LLM's conversational reply.
+        # Use the standard "I am escalating this" message.
+        if decision.status == "escalated":
+            response = self._escalation_response(query, company, results, decision.reasons)
+        elif llm_assessment and llm_assessment.response and decision.request_type != "invalid":
             response = llm_assessment.response
-            if decision.status == "escalated" and "escalat" not in normalize_text(response):
-                response = self._escalation_response(query, company, results, decision.reasons)
         elif decision.request_type == "invalid":
             response = self._invalid_response(query)
-        elif decision.status == "escalated":
-            response = self._escalation_response(query, company, results, decision.reasons)
         else:
             response = self._grounded_response(query, results)
 
@@ -708,47 +670,6 @@ class ResponseGenerator:
 def split_sentences(text: str) -> list[str]:
     pieces = re.split(r"(?<=[.!?])\s+", text)
     return [re.sub(r"\s+", " ", piece).strip(" -") for piece in pieces if piece.strip()]
-
-
-def choose_product_area(query: str, results: list[RetrievalResult]) -> str:
-    if not results:
-        return ""
-    text = f" {normalize_text(query)} "
-    top = results[0].chunk
-
-    if top.company == "HackerRank":
-        if re.search(r"\b(mock interview|resume builder|certificate|community|apply tab)\b", text):
-            return "community"
-        if re.search(r"\b(subscription|billing|payment|refund|money)\b", text):
-            return "community" if "mock interview" in text else "settings"
-        if re.search(r"\b(remove|deactivate|delete)\b", text) and re.search(
-            r"\b(user|interviewer|employee|member|hiring account)\b", text
-        ):
-            return "settings"
-        if re.search(r"\b(interview|lobby|zoom)\b", text) and "assessment" not in text:
-            return "interviews"
-        if re.search(r"\b(test|assessment|candidate|submission|score|recruiter|variant|invite|reinvite|extra time)\b", text):
-            return "screen"
-
-    if top.company == "Visa":
-        if "traveller" in text or "traveler" in text:
-            return "travel_support"
-        if "dispute" in text or "charge" in text:
-            return "dispute_resolution"
-        if "lost or stolen" in text or "stolen visa card" in text or "minimum" in text:
-            return "general_support"
-
-    if top.company == "Claude":
-        if "conversation" in text or "temporary chat" in text:
-            return "conversation_management"
-        if "crawl" in text or "data" in text or "privacy" in text:
-            return "privacy"
-        if "bedrock" in text:
-            return "amazon_bedrock"
-        if "lti" in text or "canvas" in text or "students" in text:
-            return "claude_for_education"
-
-    return top.product_area
 
 
 def reconcile_labels(

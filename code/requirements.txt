@@ -1,3 +1,13 @@
 faiss-cpu>=1.8.0
+
+# Core Vector Operations
 numpy>=1.26.0
-sentence-transformers
+
+# Local Semantic Embeddings (Hugging Face)
+sentence-transformers>=2.2.2
+
+# Environment & API Management
+python-dotenv>=1.0.0
+
+# Optional: High-performance search (only if using faiss-based retrieval)
+# faiss-cpu>=1.8.0
