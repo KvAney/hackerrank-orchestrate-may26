@@ -2,15 +2,25 @@
 
 This directory contains the Python entry point for the HackerRank Orchestrate submission.
 
-## Approach
+# Support Triage Agent Core Logic
 
-`main.py` builds one unified retrieval index over all markdown files in `../data`.
-It always builds deterministic TF-IDF vectors. If `OPENAI_API_KEY` is present, it also builds cached OpenAI embeddings. If `faiss-cpu` is installed, those embeddings are loaded into a FAISS index for vector search.
+This agent uses a **Semantic-First** architecture to triage tickets for HackerRank, Claude, and Visa.
 
-The agent resolves the best company context, retrieves the top support documents, computes TF-IDF labels, asks the LLM for `product_area`, `request_type`, and `response`, then compares LLM labels with TF-IDF labels before writing the final output. The `justification` remains code-generated for transparency.
+## 🚀 How it Works
+1. **Semantic Retrieval:** Uses `sentence-transformers` and `numpy` to find the most relevant support documents without relying on fragile keyword matching.
+2. **LLM Reasoning:** Uses **OpenRouter (Gemma-4-31B)** to evaluate intent. It identifies "Human-Required" cases such as:
+   - System outages or bugs.
+   - Financial requests (refunds/billing).
+   - Permission-restricted actions (admin overrides).
+3. **Intent Gating:** Identifies "out-of-scope" rants (e.g., test score disputes) and provides a firm policy-based refusal instead of escalating them to human staff.
 
-No network calls or API keys are required for the offline TF-IDF fallback.
+## 📦 Requirements
+- `numpy`
+- `sentence-transformers`
+- `python-dotenv`
 
+## 🏃 Execution
+`python code/main.py --retrieval-mode embedding --llm-provider openrouter`
 ## Run
 
 From the repository root:

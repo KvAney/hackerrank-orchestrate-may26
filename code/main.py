@@ -27,7 +27,7 @@ import numpy as np
 
 SUPPORTED_COMPANIES = {"hackerrank": "HackerRank", "claude": "Claude", "visa": "Visa"}
 ALLOWED_REQUEST_TYPES = {"product_issue", "feature_request", "bug", "invalid"}
-LOW_CONFIDENCE_THRESHOLD = 0.55
+LOW_CONFIDENCE_THRESHOLD = 0.45
 COMPANY_OVERRIDE_MARGIN = 0.05
 COMPANY_OVERRIDE_MIN_SCORE = 0.70
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
@@ -365,6 +365,7 @@ class OpenRouterClient:
     "1. If the docs explain HOW to do exactly what the user wants: set request_type='product_issue' and needs_human=false.\n"
     "2. If the user wants to do something the docs DO NOT mention as a feature: set request_type='feature_request' and needs_human=true.\n"
     "3. If the user says a feature IS NOT WORKING (error, down, fails): set request_type='bug' and needs_human=true.\n"
+    "3.1. If the user mentions a feature is 'down', 'broken', or 'not working', set needs_human: true regardless of documentation match.\n"
     "4. If the user lacks permission (non-admin asking for admin action): set request_type='product_issue' and needs_human=true (Escalate for Policy).\n\n"
     "Return JSON: {product_area, request_type, response, needs_human, rationale}"
     )
@@ -464,8 +465,6 @@ class VectorStoreManager:
             print("Semantic index built successfully.")
         
 
-
-
     def semantic_search(self, query: str, company: Optional[str] = None, top_k: int = 3) -> list[RetrievalResult]:
         """Search using Cosine Similarity via Numpy dot product."""
         if self.embedding_vectors is None or not self.chunks:
@@ -493,50 +492,6 @@ class VectorStoreManager:
         return sorted(results, key=lambda x: x.score, reverse=True)[:top_k]
     
 
-
-    def _fit_faiss(self) -> None:
-        # 1. Check if we even have data to index
-            if not self.embedding_vectors or not FAISS_AVAILABLE:
-                print("DEBUG: FAISS not initialized - check if OPENAI_API_KEY is set and functional.")
-                return
-            
-            # 2. Build the index
-            matrix = np.array(self.embedding_vectors, dtype="float32")
-            faiss.normalize_L2(matrix)
-            index = faiss.IndexFlatIP(matrix.shape[1])
-            index.add(matrix)
-            
-            self.faiss_index = index
-            self.faiss_available = True
-            
-            # 3. Save to disk (Ensure directory exists first)
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            index_path = str(self.cache_dir / "faiss.index")
-            faiss.write_index(index, index_path)
-            print(f"DEBUG: FAISS index saved to {index_path}")
-
-    def faiss_search(self, query: str, company: Optional[str] = None, top_k: int = 3) -> list[RetrievalResult]:
-        query_embedding = self.query_embedding(query)
-        if query_embedding is None or not self.faiss_available or np is None or faiss is None:
-            return []
-        query_matrix = np.array([query_embedding], dtype="float32")
-        faiss.normalize_L2(query_matrix)
-        search_k = len(self.chunks)
-        scores, indices = self.faiss_index.search(query_matrix, search_k)
-        company_normalized = (company or "").lower()
-        results: list[RetrievalResult] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
-                continue
-            chunk = self.chunks[int(idx)]
-            if company_normalized and chunk.company.lower() != company_normalized:
-                continue
-            results.append(RetrievalResult(chunk=chunk, score=max(0.0, float(score))))
-            if len(results) >= top_k:
-                break
-        return results
-
-
 class Retriever:
     def __init__(self, store: VectorStoreManager, mode: str = "tfidf") -> None:
         self.store = store
@@ -547,37 +502,6 @@ class Retriever:
         if mode in {"embedding", "hybrid"} and not store.embedding_available:
             mode = "tfidf"
         self.mode = mode
-
-    # def search(self, query: str, company: Optional[str] = None, top_k: int = 3) -> list[RetrievalResult]:
-    #     if self.mode == "faiss":
-    #         faiss_results = self.store.faiss_search(query, company=company, top_k=top_k)
-    #         if faiss_results:
-    #             return faiss_results
-
-    #     query_vector, query_norm, query_terms = self.store.query_vector(query)
-    #     query_embedding = self.store.query_embedding(query) if self.mode in {"embedding", "hybrid"} else None
-    #     results: list[RetrievalResult] = []
-    #     company_normalized = (company or "").lower()
-
-    #     for idx, chunk in enumerate(self.store.chunks):
-    #         if company_normalized and chunk.company.lower() != company_normalized:
-    #             continue
-    #         tfidf_score = self._tfidf_score(idx, query_vector, query_norm, query_terms, chunk)
-    #         embedding_score = 0.0
-    #         if query_embedding is not None and idx < len(self.store.embedding_vectors):
-    #             embedding_score = max(0.0, dense_cosine(query_embedding, self.store.embedding_vectors[idx]))
-
-    #         if self.mode == "embedding":
-    #             score = embedding_score
-    #         elif self.mode == "hybrid":
-    #             score = (embedding_score * 0.65) + (tfidf_score * 0.35)
-    #         else:
-    #             score = tfidf_score
-    #         if score > 0:
-    #             results.append(RetrievalResult(chunk=chunk, score=score))
-
-    #     results.sort(key=lambda item: (item.score, item.chunk.company, item.chunk.source_path), reverse=True)
-    #     return results[:top_k]
 
     def search(self, query: str, company: Optional[str] = None, top_k: int = 3) -> list[RetrievalResult]:
         """Directly uses the new semantic search from VectorStoreManager."""
@@ -600,32 +524,6 @@ class Retriever:
         ):
             return CompanyResolution(requested, global_company, filtered_score, global_score, True)
         return CompanyResolution(requested, requested or global_company, filtered_score, global_score, False)
-
-    def _tfidf_score(
-        self,
-        idx: int,
-        query_vector: dict[str, float],
-        query_norm: float,
-        query_terms: set[str],
-        chunk: DocumentChunk,
-    ) -> float:
-        vector = self.store.vectors[idx]
-        raw_score = sum(query_vector.get(token, 0.0) * weight for token, weight in vector.items())
-        raw_score = raw_score / (query_norm * self.store.norms[idx])
-        return self._calibrated_score(raw_score, query_terms, chunk)
-
-    @staticmethod
-    def _calibrated_score(raw_score: float, query_terms: set[str], chunk: DocumentChunk) -> float:
-        chunk_terms = set(tokenize(f"{chunk.title} {chunk.product_area} {chunk.text}"))
-        coverage = len(query_terms & chunk_terms) / max(1, len(query_terms))
-        title_terms = set(tokenize(chunk.title))
-        title_overlap = len(query_terms & title_terms) / max(1, len(query_terms))
-        score = (raw_score * 2.45) + (coverage * 0.60) + (title_overlap * 0.25)
-        if "delete" in query_terms and "delete" in title_terms:
-            score += 0.15
-        if "conversation" in query_terms and "conversation" in title_terms:
-            score += 0.10
-        return min(1.0, score)
 
 
 def normalize_company(company: object) -> Optional[str]:
@@ -657,36 +555,29 @@ class Classifier:
         # Default to product_issue; let the LLM refine to 'bug' or 'feature_request'
         return "product_issue"
 
-    def decide(
-        self, 
-        query: str, 
-        results: list[RetrievalResult], 
-        product_area: str, 
-        request_type: str, 
-        llm_assessment: Optional[LLMAssessment] = None
-    ) -> TriageDecision:
-        """
-        Makes the final decision based on LLM 'needs_human' flag 
-        or a strict low-confidence fallback.
-        """
+    def decide(self, query: str, results: list[RetrievalResult], product_area: str, request_type: str, llm_assessment: Optional[LLMAssessment] = None) -> TriageDecision:
         top_score = results[0].score if results else 0.0
         reasons: list[str] = []
 
-        # 1. PRIORITY: If LLM flagged it (Down, Sensitive, or No Permission)
+        # 1. PRIORITY: If LLM flagged it (Down, Refund, Bug, or No Permission)
         if llm_assessment and getattr(llm_assessment, 'needs_human', False):
             reasons.append(f"AI Flagged: {llm_assessment.rationale}")
 
-        # 2. RANTS: If LLM labeled it invalid, return REPLIED immediately
+        # 2. FALLBACK: If AI is offline, be aggressive about escalating "Refunds" and "Bugs"
+        elif not llm_assessment:
+            text = normalize_text(query)
+            if "refund" in text or "money back" in text or "not working" in text:
+                reasons.append("financial request or technical failure requiring review")
+            if top_score < LOW_CONFIDENCE_THRESHOLD:
+                reasons.append(f"low confidence fallback ({top_score:.2f})")
+
+        # 3. RANTS: If it's just an invalid rant, don't escalate, just reply
         if request_type == "invalid":
             return TriageDecision("replied", product_area, "invalid", False, ("out of scope",))
 
-        # 3. SAFETY FALLBACK: If AI is offline, use score threshold
-        if not llm_assessment and top_score < LOW_CONFIDENCE_THRESHOLD:
-            reasons.append(f"Low retrieval confidence ({top_score:.2f})")
-
         status = "escalated" if reasons else "replied"
         return TriageDecision(status, product_area, request_type, top_score < LOW_CONFIDENCE_THRESHOLD, tuple(reasons))
-    
+
 class ResponseGenerator:
     def generate(
         self,
@@ -768,6 +659,7 @@ class ResponseGenerator:
             prefix = "Identity theft or possible fraud needs urgent specialist handling."
         elif "lost access" in text or "removed my seat" in text:
             prefix = "Workspace access changes must be handled by the appropriate workspace or organization administrator."
+       
 
         doc_hint = ""
         if results:
@@ -932,31 +824,31 @@ class TriageEngine:
         query = f"{subject or ''}\n{issue or ''}".strip()
         resolution = self.retriever.resolve_company(query, company)
         
-        # 1. Retrieval
+        # 1. Semantic Retrieval (Hugging Face + Numpy)
         results = self.retriever.search(query, company=resolution.resolved_company, top_k=3)
         top_score = results[0].score if results else 0.0
         
-        # 2. Baseline Labels
-        base_area = choose_product_area(query, results)
+        # 2. Baseline Labels (Simple and clean)
+        # We replace the choose_product_area call with the area from our best doc match
+        base_area = results[0].chunk.product_area if results else "general_support"
         base_type = self.classifier.classify_request_type(query, top_score)
         
         # 3. LLM Assessment (The Brain)
-        # It now returns {needs_human: True/False} based on your new prompt
         llm_assessment = self._llm_assessment(
             query, resolution.resolved_company, "pending", base_area, base_type, results
         )
         
-        # 4. Reconcile
+        # 4. Reconcile (Trust the LLM to override the baseline)
         product_area, request_type, label_notes = reconcile_labels(
             base_area, base_type, llm_assessment, top_score
         )
         
-        # 5. FINAL DECISION (Pass the llm_assessment here!)
+        # 5. Final Decision
         decision = self.classifier.decide(
             query, results, product_area, request_type, llm_assessment=llm_assessment
         )
         
-        # 6. Response
+        # 6. Response Generation
         response, justification = self.generator.generate(
             query, resolution.resolved_company, decision, results, resolution, 
             llm_assessment=llm_assessment, label_notes=label_notes
@@ -967,7 +859,7 @@ class TriageEngine:
             "status": decision.status, "product_area": product_area,
             "request_type": request_type, "response": response, "justification": justification
         }
-
+    
     def _llm_assessment(
         self,
         query: str,
@@ -1087,7 +979,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", type=Path, default=repo_root / "data")
     parser.add_argument(
         "--retrieval-mode",
-        choices=("auto", "tfidf", "embedding", "hybrid", "faiss"),
+        choices=("auto", "embedding", "hybrid", "faiss"),
         default=os.getenv("RETRIEVAL_MODE", "auto"),
         help="auto uses FAISS when available, then hybrid embeddings, otherwise TF-IDF",
     )
